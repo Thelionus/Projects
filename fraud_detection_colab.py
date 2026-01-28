@@ -784,7 +784,14 @@ for filename in uploaded.keys():
 """
 
 # If running as a script (not Colab), support command-line usage
-if __name__ == "__main__":
+def _is_notebook():
+    try:
+        get_ipython()
+        return True
+    except NameError:
+        return False
+
+if __name__ == "__main__" and not _is_notebook():
     import sys
     if len(sys.argv) > 1:
         for f in sys.argv[1:]:
