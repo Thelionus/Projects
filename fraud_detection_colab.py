@@ -420,10 +420,319 @@ def luminance_gradient_analysis(img, block_size=32):
 
 
 # ============================================================
+#  DOCUMENT-SPECIFIC FRAUD DETECTION
+# ============================================================
+
+def detect_text_regions(img):
+    """Use edge detection and morphology to find text-like regions."""
+    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+
+    # Adaptive threshold to find text
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # Dilate to connect text characters into regions
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+    dilated = cv2.dilate(thresh, kernel, iterations=2)
+
+    # Find contours
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    text_regions = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        # Filter by aspect ratio and size (text-like regions)
+        if w > 20 and h > 5 and w/h > 1.5 and h < 100:
+            text_regions.append((x, y, w, h))
+
+    return text_regions, gray, thresh
+
+
+def font_consistency_analysis(img):
+    """
+    Analyze font rendering consistency across text regions.
+    Different fonts or rendering = potential text replacement.
+    """
+    text_regions, gray, thresh = detect_text_regions(img)
+
+    if len(text_regions) < 3:
+        return [], 0.0, None
+
+    region_features = []
+
+    for (x, y, w, h) in text_regions:
+        roi = gray[y:y+h, x:x+w]
+        if roi.size == 0:
+            continue
+
+        # Extract features that characterize text rendering
+        # 1. Edge density (how sharp are the letters)
+        edges = cv2.Canny(roi, 50, 150)
+        edge_density = np.mean(edges > 0)
+
+        # 2. Stroke width estimation via distance transform
+        roi_bin = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        dist = cv2.distanceTransform(roi_bin, cv2.DIST_L2, 5)
+        stroke_width = np.mean(dist[dist > 0]) if np.any(dist > 0) else 0
+
+        # 3. Local contrast
+        local_std = np.std(roi)
+
+        # 4. Mean intensity
+        mean_intensity = np.mean(roi)
+
+        # 5. Gradient magnitude (text sharpness)
+        gx = cv2.Sobel(roi, cv2.CV_64F, 1, 0, ksize=3)
+        gy = cv2.Sobel(roi, cv2.CV_64F, 0, 1, ksize=3)
+        grad_mag = np.mean(np.sqrt(gx**2 + gy**2))
+
+        region_features.append({
+            'bbox': (x, y, w, h),
+            'edge_density': edge_density,
+            'stroke_width': stroke_width,
+            'local_std': local_std,
+            'mean_intensity': mean_intensity,
+            'grad_mag': grad_mag,
+        })
+
+    if len(region_features) < 3:
+        return [], 0.0, None
+
+    # Convert to numpy for statistical analysis
+    features_matrix = np.array([
+        [f['edge_density'], f['stroke_width'], f['local_std'], f['grad_mag']]
+        for f in region_features
+    ])
+
+    # Normalize features
+    means = features_matrix.mean(axis=0)
+    stds = features_matrix.std(axis=0)
+    stds[stds < 1e-6] = 1.0
+    z_scores = np.abs(features_matrix - means) / stds
+
+    # Combined anomaly score per region
+    region_anomaly_scores = z_scores.mean(axis=1)
+
+    # Flag outliers (z > 1.5 is suspicious for documents)
+    anomalies = []
+    for i, f in enumerate(region_features):
+        f['anomaly_score'] = float(region_anomaly_scores[i])
+        if region_anomaly_scores[i] > 1.5:
+            anomalies.append(f)
+
+    # Sort by anomaly score
+    anomalies.sort(key=lambda x: x['anomaly_score'], reverse=True)
+
+    # Overall score based on how many anomalous regions
+    overall_score = min(100, len(anomalies) / max(len(region_features), 1) * 200)
+
+    return anomalies, overall_score, region_features
+
+
+def background_uniformity_analysis(img):
+    """
+    Check if background around/under text is uniform.
+    Edited text often has slightly different background.
+    """
+    text_regions, gray, _ = detect_text_regions(img)
+
+    if len(text_regions) < 2:
+        return [], 0.0
+
+    background_samples = []
+
+    for (x, y, w, h) in text_regions:
+        # Sample background just above and below text
+        pad = 3
+
+        # Above
+        if y > pad:
+            above = gray[max(0,y-pad-2):y-pad, x:x+w]
+            if above.size > 0:
+                background_samples.append({
+                    'bbox': (x, y, w, h),
+                    'location': 'above',
+                    'mean': float(np.mean(above)),
+                    'std': float(np.std(above)),
+                    'median': float(np.median(above)),
+                })
+
+        # Below
+        if y + h + pad < gray.shape[0]:
+            below = gray[y+h+pad:min(gray.shape[0], y+h+pad+2), x:x+w]
+            if below.size > 0:
+                background_samples.append({
+                    'bbox': (x, y, w, h),
+                    'location': 'below',
+                    'mean': float(np.mean(below)),
+                    'std': float(np.std(below)),
+                    'median': float(np.median(below)),
+                })
+
+    if len(background_samples) < 3:
+        return [], 0.0
+
+    # Analyze consistency
+    means = np.array([s['mean'] for s in background_samples])
+    overall_mean = np.mean(means)
+    overall_std = np.std(means)
+
+    if overall_std < 1e-6:
+        return [], 0.0
+
+    # Find outliers
+    anomalies = []
+    for s in background_samples:
+        z = abs(s['mean'] - overall_mean) / overall_std
+        s['z_score'] = float(z)
+        if z > 2.0:
+            anomalies.append(s)
+
+    score = min(100, len(anomalies) / max(len(background_samples), 1) * 300)
+    return anomalies, score
+
+
+def text_alignment_analysis(img):
+    """
+    Check if text is properly aligned on baselines.
+    Pasted text often has slight vertical misalignment.
+    """
+    text_regions, gray, _ = detect_text_regions(img)
+
+    if len(text_regions) < 3:
+        return [], 0.0
+
+    # Group regions by approximate y-position (same line)
+    sorted_regions = sorted(text_regions, key=lambda r: r[1])
+
+    lines = []
+    current_line = [sorted_regions[0]]
+
+    for region in sorted_regions[1:]:
+        # If y is within tolerance, same line
+        if abs(region[1] - current_line[-1][1]) < 10:
+            current_line.append(region)
+        else:
+            if len(current_line) >= 2:
+                lines.append(current_line)
+            current_line = [region]
+
+    if len(current_line) >= 2:
+        lines.append(current_line)
+
+    # Analyze alignment within each line
+    misalignments = []
+
+    for line in lines:
+        if len(line) < 2:
+            continue
+
+        # Get baseline (bottom of each region)
+        baselines = [r[1] + r[3] for r in line]
+        mean_baseline = np.mean(baselines)
+
+        for i, region in enumerate(line):
+            deviation = abs(baselines[i] - mean_baseline)
+            if deviation > 3:  # More than 3 pixels off
+                misalignments.append({
+                    'bbox': region,
+                    'baseline_deviation': float(deviation),
+                    'expected_baseline': float(mean_baseline),
+                    'actual_baseline': float(baselines[i]),
+                })
+
+    score = min(100, len(misalignments) * 15)
+    return misalignments, score
+
+
+def micro_pattern_analysis(img, block_size=8):
+    """
+    Analyze micro-level patterns around text.
+    Detects subtle differences in rendering, anti-aliasing, or compression.
+    """
+    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+    # Compute local binary pattern-like features
+    h, w = gray.shape
+
+    # High-frequency component (very fine details)
+    blurred = ndimage.gaussian_filter(gray, sigma=0.5)
+    high_freq = gray - blurred
+
+    # Compute local statistics in small blocks
+    bh, bw = h // block_size, w // block_size
+    if bh == 0 or bw == 0:
+        return np.zeros((1,1)), [], 0.0
+
+    crop = high_freq[:bh*block_size, :bw*block_size]
+    blocks = view_as_blocks(crop, (block_size, block_size))
+
+    # Features per block
+    block_energy = np.sum(blocks**2, axis=(2, 3))
+    block_mean = np.mean(blocks, axis=(2, 3))
+    block_std = np.std(blocks, axis=(2, 3))
+
+    # Combined feature
+    feature_map = block_energy / (block_std + 1e-6)
+
+    # Find anomalies
+    overall_mean = np.mean(feature_map)
+    overall_std = np.std(feature_map)
+
+    if overall_std < 1e-6:
+        return feature_map, [], 0.0
+
+    z_map = np.abs(feature_map - overall_mean) / overall_std
+    anomaly_mask = z_map > 2.5
+
+    # Get coordinates of anomalies
+    anomaly_coords = []
+    for i in range(anomaly_mask.shape[0]):
+        for j in range(anomaly_mask.shape[1]):
+            if anomaly_mask[i, j]:
+                anomaly_coords.append({
+                    'block': (j * block_size, i * block_size),
+                    'size': block_size,
+                    'z_score': float(z_map[i, j]),
+                })
+
+    score = min(100, np.sum(anomaly_mask) / anomaly_mask.size * 200)
+    return feature_map, anomaly_coords, score
+
+
+def is_document_image(img):
+    """Detect if image is a document (vs a photo)."""
+    gray = np.array(img.convert("L"))
+
+    # Documents tend to have:
+    # 1. High contrast (mostly white background with dark text)
+    # 2. Bimodal histogram
+    # 3. Lots of straight edges
+
+    # Check histogram bimodality
+    hist, _ = np.histogram(gray.flatten(), bins=256, range=(0, 256))
+    hist = hist / hist.sum()
+
+    # Documents have peaks near 0 (text) and 255 (background)
+    dark_ratio = hist[:50].sum()
+    light_ratio = hist[200:].sum()
+
+    is_doc = light_ratio > 0.5 and dark_ratio > 0.01
+    confidence = min(1.0, light_ratio + dark_ratio * 2)
+
+    return is_doc, confidence
+
+
+# ============================================================
 #  COMPOSITE FRAUD DETECTOR
 # ============================================================
 
-ANALYSIS_WEIGHTS = {
+# Weights for PHOTO analysis
+PHOTO_WEIGHTS = {
     "ela": 0.20,
     "noise": 0.15,
     "copy_move": 0.15,
@@ -436,8 +745,29 @@ ANALYSIS_WEIGHTS = {
     "luminance": 0.05,
 }
 
+# Weights for DOCUMENT analysis (pay stubs, invoices, etc.)
+DOCUMENT_WEIGHTS = {
+    "ela": 0.10,
+    "noise": 0.05,
+    "copy_move": 0.00,  # Disabled - too many false positives on documents
+    "edge": 0.05,
+    "local_variance": 0.05,
+    "channel": 0.05,
+    "jpeg_ghost": 0.05,
+    "metadata": 0.05,
+    "text_region": 0.10,
+    "luminance": 0.05,
+    # Document-specific (45% weight)
+    "font_consistency": 0.15,
+    "background_uniformity": 0.10,
+    "text_alignment": 0.10,
+    "micro_pattern": 0.10,
+}
 
-def run_full_analysis(img, image_path=None):
+ANALYSIS_WEIGHTS = PHOTO_WEIGHTS  # Default
+
+
+def run_full_analysis(img, image_path=None, force_document_mode=None):
     """
     Run all 10 forensic analyses on a single image.
     Returns a results dictionary with scores and visual outputs.
@@ -525,23 +855,97 @@ def run_full_analysis(img, image_path=None):
         "score": round(lum_score, 1),
     }
 
-    # Weighted overall
+    # --- Detect if this is a document or photo ---
+    is_doc, doc_confidence = is_document_image(img)
+
+    # Override detection if user forces a mode
+    if force_document_mode is not None:
+        is_doc = force_document_mode
+
+    results["is_document"] = is_doc
+    results["document_confidence"] = round(doc_confidence, 2)
+
+    # --- Document-specific analyses (only run if document detected) ---
+    if is_doc:
+        # 11. Font Consistency
+        font_anomalies, font_score, all_font_features = font_consistency_analysis(img)
+        results["font_consistency"] = {
+            "anomalies": [
+                {"bbox": a["bbox"], "anomaly_score": round(a["anomaly_score"], 2)}
+                for a in font_anomalies[:10]
+            ],
+            "score": round(font_score, 1),
+        }
+
+        # 12. Background Uniformity
+        bg_anomalies, bg_score = background_uniformity_analysis(img)
+        results["background_uniformity"] = {
+            "anomalies": [
+                {"bbox": a["bbox"], "z_score": round(a["z_score"], 2)}
+                for a in bg_anomalies[:10]
+            ],
+            "score": round(bg_score, 1),
+        }
+
+        # 13. Text Alignment
+        align_issues, align_score = text_alignment_analysis(img)
+        results["text_alignment"] = {
+            "misalignments": [
+                {"bbox": a["bbox"], "deviation": round(a["baseline_deviation"], 1)}
+                for a in align_issues[:10]
+            ],
+            "score": round(align_score, 1),
+        }
+
+        # 14. Micro Pattern Analysis
+        micro_map, micro_anomalies, micro_score = micro_pattern_analysis(img)
+        results["micro_pattern"] = {
+            "anomaly_count": len(micro_anomalies),
+            "score": round(micro_score, 1),
+        }
+
+        # Use document weights
+        weights = DOCUMENT_WEIGHTS
+    else:
+        # Zero out document-specific scores for photos
+        results["font_consistency"] = {"anomalies": [], "score": 0.0}
+        results["background_uniformity"] = {"anomalies": [], "score": 0.0}
+        results["text_alignment"] = {"misalignments": [], "score": 0.0}
+        results["micro_pattern"] = {"anomaly_count": 0, "score": 0.0}
+        weights = PHOTO_WEIGHTS
+
+    # --- Weighted overall score ---
     weighted = sum(
         results.get(k, {}).get("score", 0) * w
-        for k, w in ANALYSIS_WEIGHTS.items()
+        for k, w in weights.items()
     )
     overall = min(100.0, weighted)
 
-    if overall >= 65:
-        verdict = "HIGH - Very likely manipulated"
-    elif overall >= 40:
-        verdict = "MEDIUM - Possibly manipulated, review recommended"
-    elif overall >= 20:
-        verdict = "LOW - Minor anomalies detected"
+    # For documents, adjust thresholds (they need to be more sensitive)
+    if is_doc:
+        if overall >= 45:
+            verdict = "HIGH - Very likely manipulated"
+        elif overall >= 25:
+            verdict = "MEDIUM - Possibly manipulated, review recommended"
+        elif overall >= 10:
+            verdict = "LOW - Minor anomalies detected"
+        else:
+            verdict = "CLEAN - No significant manipulation detected"
     else:
-        verdict = "CLEAN - No significant manipulation detected"
+        if overall >= 65:
+            verdict = "HIGH - Very likely manipulated"
+        elif overall >= 40:
+            verdict = "MEDIUM - Possibly manipulated, review recommended"
+        elif overall >= 20:
+            verdict = "LOW - Minor anomalies detected"
+        else:
+            verdict = "CLEAN - No significant manipulation detected"
 
-    results["overall"] = {"score": round(overall, 1), "verdict": verdict}
+    results["overall"] = {
+        "score": round(overall, 1),
+        "verdict": verdict,
+        "mode": "DOCUMENT" if is_doc else "PHOTO",
+    }
     return results
 
 
@@ -555,21 +959,38 @@ def display_results(img, results, page_label=""):
     overall = results["overall"]
     score = overall["score"]
     verdict = overall["verdict"]
+    mode = overall.get("mode", "PHOTO")
+    is_doc = results.get("is_document", False)
 
-    # Color for verdict
-    if score >= 65:
-        color = "#e74c3c"
-    elif score >= 40:
-        color = "#f39c12"
+    # Color for verdict - use document thresholds if document
+    if is_doc:
+        if score >= 45:
+            color = "#e74c3c"
+        elif score >= 25:
+            color = "#f39c12"
+        else:
+            color = "#27ae60"
     else:
-        color = "#27ae60"
+        if score >= 65:
+            color = "#e74c3c"
+        elif score >= 40:
+            color = "#f39c12"
+        else:
+            color = "#27ae60"
+
+    # Mode badge color
+    mode_color = "#9b59b6" if is_doc else "#3498db"
 
     # Header
     display(HTML(f"""
     <div style="background: linear-gradient(135deg, #1a1a2e, #16213e);
                 padding: 20px; border-radius: 10px; margin: 10px 0;
                 font-family: monospace; color: white;">
-        <h2 style="margin:0;">{'Fraud Detection Report' + (' - ' + page_label if page_label else '')}</h2>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+            <h2 style="margin:0;">{'Fraud Detection Report' + (' - ' + page_label if page_label else '')}</h2>
+            <span style="background: {mode_color}; padding: 5px 15px; border-radius: 20px;
+                         font-size: 12px; font-weight: bold;">{mode} MODE</span>
+        </div>
         <h1 style="color: {color}; margin: 10px 0;">
             Score: {score:.1f} / 100
         </h1>
@@ -577,7 +998,10 @@ def display_results(img, results, page_label=""):
     </div>
     """))
 
-    # Score breakdown table
+    # Get the right weights for display
+    weights = DOCUMENT_WEIGHTS if is_doc else PHOTO_WEIGHTS
+
+    # Score breakdown table - base analyses
     rows = ""
     labels = {
         "ela": "Error Level Analysis",
@@ -591,9 +1015,17 @@ def display_results(img, results, page_label=""):
         "text_region": "Text Region Anomalies",
         "luminance": "Luminance Gradient",
     }
+
+    # Add document-specific labels
+    if is_doc:
+        labels["font_consistency"] = "Font Consistency"
+        labels["background_uniformity"] = "Background Uniformity"
+        labels["text_alignment"] = "Text Alignment"
+        labels["micro_pattern"] = "Micro Pattern Analysis"
+
     for key, label in labels.items():
         s = results.get(key, {}).get("score", 0)
-        w = ANALYSIS_WEIGHTS.get(key, 0) * 100
+        w = weights.get(key, 0) * 100
         bar_width = int(s * 2)
         if s >= 50:
             bar_color = "#e74c3c"
@@ -741,6 +1173,53 @@ def display_results(img, results, page_label=""):
             )}
         </div>
         """))
+
+    # --- Document-specific findings ---
+    if is_doc:
+        doc_findings = []
+
+        # Font consistency issues
+        font_anomalies = results.get("font_consistency", {}).get("anomalies", [])
+        if font_anomalies:
+            doc_findings.append(f"<b>Font Inconsistencies:</b> {len(font_anomalies)} region(s) with different text rendering")
+
+        # Background uniformity issues
+        bg_anomalies = results.get("background_uniformity", {}).get("anomalies", [])
+        if bg_anomalies:
+            doc_findings.append(f"<b>Background Issues:</b> {len(bg_anomalies)} region(s) with inconsistent background")
+
+        # Text alignment issues
+        align_issues = results.get("text_alignment", {}).get("misalignments", [])
+        if align_issues:
+            doc_findings.append(f"<b>Alignment Issues:</b> {len(align_issues)} text region(s) misaligned from baseline")
+
+        # Micro pattern anomalies
+        micro_count = results.get("micro_pattern", {}).get("anomaly_count", 0)
+        if micro_count > 5:
+            doc_findings.append(f"<b>Micro Pattern Anomalies:</b> {micro_count} suspicious micro-level pattern breaks")
+
+        if doc_findings:
+            display(HTML(f"""
+            <div style="background:#9b59b6; color:white; padding:12px; border-radius:6px;
+                        font-family:monospace; margin:10px 0;">
+                <b style="font-size:14px;">DOCUMENT-SPECIFIC FINDINGS:</b><br><br>
+                {'<br>'.join(doc_findings)}
+            </div>
+            """))
+
+        # Show font anomaly details
+        if font_anomalies:
+            display(HTML(f"""
+            <div style="background:#2c3e50; color:white; padding:12px; border-radius:6px;
+                        font-family:monospace; margin:10px 0;">
+                <b>Font Rendering Anomalies (text may have been replaced):</b><br>
+                {'<br>'.join(
+                    f'  Text region at ({a["bbox"][0]},{a["bbox"][1]}) '
+                    f'size={a["bbox"][2]}x{a["bbox"][3]} - anomaly_score={a["anomaly_score"]}'
+                    for a in font_anomalies[:10]
+                )}
+            </div>
+            """))
 
 
 # ============================================================
