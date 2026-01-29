@@ -423,6 +423,136 @@ def luminance_gradient_analysis(img, block_size=32):
 #  DOCUMENT-SPECIFIC FRAUD DETECTION
 # ============================================================
 
+def header_name_analysis(img):
+    """
+    Specifically analyze the header/name area of documents.
+    Names on pay stubs, invoices typically appear in top-left.
+    Compare this region to the rest of the document.
+    """
+    cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    h, w = gray.shape
+
+    # Define header region (top 15% of document, left 50%)
+    header_h = int(h * 0.15)
+    header_w = int(w * 0.50)
+    header_region = gray[:header_h, :header_w]
+
+    # Define body region (rest of document for comparison)
+    body_region = gray[header_h:, :]
+
+    findings = []
+    score = 0.0
+
+    # 1. Compare noise levels
+    header_blur = ndimage.gaussian_filter(header_region, sigma=1.0)
+    header_noise = np.std(header_region - header_blur)
+
+    body_blur = ndimage.gaussian_filter(body_region, sigma=1.0)
+    body_noise = np.std(body_region - body_blur)
+
+    noise_diff = abs(header_noise - body_noise)
+    if noise_diff > body_noise * 0.3:  # 30% difference
+        findings.append(f"Header noise differs from body by {noise_diff:.2f}")
+        score += 25
+
+    # 2. Analyze text rendering in header specifically
+    header_gray = gray[:header_h, :header_w].astype(np.uint8)
+
+    # Find text in header using adaptive threshold
+    header_thresh = cv2.adaptiveThreshold(
+        header_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # Find contours (text regions) in header
+    contours, _ = cv2.findContours(header_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    header_text_features = []
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        if cw > 10 and ch > 5 and cw * ch > 100:  # Filter small noise
+            roi = header_gray[y:y+ch, x:x+cw]
+
+            # Features
+            edges = cv2.Canny(roi, 50, 150)
+            edge_density = np.mean(edges > 0)
+
+            # Background around text
+            pad = 2
+            y1, y2 = max(0, y-pad), min(header_h, y+ch+pad)
+            x1, x2 = max(0, x-pad), min(header_w, x+cw+pad)
+            bg_region = header_gray[y1:y2, x1:x2]
+            bg_std = np.std(bg_region)
+
+            header_text_features.append({
+                'bbox': (x, y, cw, ch),
+                'edge_density': edge_density,
+                'bg_std': bg_std,
+                'mean_val': np.mean(roi),
+            })
+
+    # 3. Compare header text to body text
+    body_gray = gray[header_h:, :].astype(np.uint8)
+    body_thresh = cv2.adaptiveThreshold(
+        body_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+    body_contours, _ = cv2.findContours(body_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    body_text_features = []
+    for cnt in body_contours[:50]:  # Sample up to 50
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        if cw > 10 and ch > 5 and cw * ch > 100:
+            roi = body_gray[y:y+ch, x:x+cw]
+            edges = cv2.Canny(roi, 50, 150)
+            edge_density = np.mean(edges > 0)
+            body_text_features.append({
+                'edge_density': edge_density,
+                'mean_val': np.mean(roi),
+            })
+
+    # Compare edge densities
+    if header_text_features and body_text_features:
+        header_edge_avg = np.mean([f['edge_density'] for f in header_text_features])
+        body_edge_avg = np.mean([f['edge_density'] for f in body_text_features])
+
+        edge_diff = abs(header_edge_avg - body_edge_avg)
+        if edge_diff > 0.1:  # Significant difference
+            findings.append(f"Header text sharpness differs: {header_edge_avg:.3f} vs body {body_edge_avg:.3f}")
+            score += 30
+
+        # Compare mean intensities
+        header_intensity_avg = np.mean([f['mean_val'] for f in header_text_features])
+        body_intensity_avg = np.mean([f['mean_val'] for f in body_text_features])
+
+        intensity_diff = abs(header_intensity_avg - body_intensity_avg)
+        if intensity_diff > 20:  # Different text darkness
+            findings.append(f"Header text intensity differs: {header_intensity_avg:.1f} vs body {body_intensity_avg:.1f}")
+            score += 20
+
+    # 4. Check for rectangular "patch" patterns (where text was covered and retyped)
+    # Look for uniform rectangular areas in the header
+    local_var = ndimage.generic_filter(header_gray.astype(np.float64), np.var, size=10)
+    very_uniform = local_var < 5  # Very low variance = potentially pasted/covered area
+
+    uniform_ratio = np.mean(very_uniform)
+    if uniform_ratio > 0.1 and uniform_ratio < 0.9:  # Some but not all uniform
+        findings.append(f"Suspicious uniform patches in header: {uniform_ratio*100:.1f}%")
+        score += 15
+
+    # 5. Analyze specific "name-like" regions (larger text at top-left)
+    name_candidates = [f for f in header_text_features if f['bbox'][2] > 50 and f['bbox'][3] > 10]
+    for nc in name_candidates:
+        bg_std = nc['bg_std']
+        if bg_std < 3:  # Very uniform background = might be digitally added text
+            findings.append(f"Name region at {nc['bbox'][:2]} has suspiciously uniform background")
+            score += 20
+            break
+
+    return findings, min(100, score), header_text_features
+
+
 def detect_text_regions(img):
     """Use edge detection and morphology to find text-like regions."""
     cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -747,21 +877,22 @@ PHOTO_WEIGHTS = {
 
 # Weights for DOCUMENT analysis (pay stubs, invoices, etc.)
 DOCUMENT_WEIGHTS = {
-    "ela": 0.10,
+    "ela": 0.08,
     "noise": 0.05,
     "copy_move": 0.00,  # Disabled - too many false positives on documents
-    "edge": 0.05,
-    "local_variance": 0.05,
-    "channel": 0.05,
+    "edge": 0.04,
+    "local_variance": 0.04,
+    "channel": 0.04,
     "jpeg_ghost": 0.05,
     "metadata": 0.05,
     "text_region": 0.10,
     "luminance": 0.05,
-    # Document-specific (45% weight)
-    "font_consistency": 0.15,
-    "background_uniformity": 0.10,
-    "text_alignment": 0.10,
-    "micro_pattern": 0.10,
+    # Document-specific (50% weight)
+    "font_consistency": 0.12,
+    "background_uniformity": 0.08,
+    "text_alignment": 0.08,
+    "micro_pattern": 0.07,
+    "header_name": 0.15,  # HIGH weight - names are commonly altered
 }
 
 ANALYSIS_WEIGHTS = PHOTO_WEIGHTS  # Default
@@ -904,6 +1035,13 @@ def run_full_analysis(img, image_path=None, force_document_mode=None):
             "score": round(micro_score, 1),
         }
 
+        # 15. Header/Name Analysis (specifically for pay stubs, invoices)
+        header_findings, header_score, header_features = header_name_analysis(img)
+        results["header_name"] = {
+            "findings": header_findings,
+            "score": round(header_score, 1),
+        }
+
         # Use document weights
         weights = DOCUMENT_WEIGHTS
     else:
@@ -912,6 +1050,7 @@ def run_full_analysis(img, image_path=None, force_document_mode=None):
         results["background_uniformity"] = {"anomalies": [], "score": 0.0}
         results["text_alignment"] = {"misalignments": [], "score": 0.0}
         results["micro_pattern"] = {"anomaly_count": 0, "score": 0.0}
+        results["header_name"] = {"findings": [], "score": 0.0}
         weights = PHOTO_WEIGHTS
 
     # --- Weighted overall score ---
@@ -1022,6 +1161,7 @@ def display_results(img, results, page_label=""):
         labels["background_uniformity"] = "Background Uniformity"
         labels["text_alignment"] = "Text Alignment"
         labels["micro_pattern"] = "Micro Pattern Analysis"
+        labels["header_name"] = "Header/Name Analysis"
 
     for key, label in labels.items():
         s = results.get(key, {}).get("score", 0)
@@ -1177,6 +1317,14 @@ def display_results(img, results, page_label=""):
     # --- Document-specific findings ---
     if is_doc:
         doc_findings = []
+
+        # Header/Name analysis (most important for pay stubs)
+        header_findings = results.get("header_name", {}).get("findings", [])
+        header_score = results.get("header_name", {}).get("score", 0)
+        if header_findings or header_score > 20:
+            doc_findings.append(f"<b>HEADER/NAME AREA:</b> Score {header_score:.0f}/100")
+            for hf in header_findings:
+                doc_findings.append(f"  - {hf}")
 
         # Font consistency issues
         font_anomalies = results.get("font_consistency", {}).get("anomalies", [])
