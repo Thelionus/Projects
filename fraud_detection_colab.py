@@ -428,33 +428,37 @@ def header_name_analysis(img):
     Specifically analyze the header/name area of documents.
     Names on pay stubs, invoices typically appear in top-left.
     Compare this region to the rest of the document.
+    AGGRESSIVE detection for image-edited names.
     """
     cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY).astype(np.float64)
     h, w = gray.shape
 
-    # Define header region (top 15% of document, left 50%)
-    header_h = int(h * 0.15)
-    header_w = int(w * 0.50)
+    # Define header region (top 20% of document, left 60%) - EXPANDED
+    header_h = int(h * 0.20)
+    header_w = int(w * 0.60)
     header_region = gray[:header_h, :header_w]
 
-    # Define body region (rest of document for comparison)
-    body_region = gray[header_h:, :]
+    # Define body region (middle section for cleaner comparison)
+    body_start = int(h * 0.25)
+    body_end = int(h * 0.75)
+    body_region = gray[body_start:body_end, :]
 
     findings = []
     score = 0.0
 
-    # 1. Compare noise levels
-    header_blur = ndimage.gaussian_filter(header_region, sigma=1.0)
+    # 1. Compare noise levels - MORE SENSITIVE
+    header_blur = ndimage.gaussian_filter(header_region, sigma=0.8)
     header_noise = np.std(header_region - header_blur)
 
-    body_blur = ndimage.gaussian_filter(body_region, sigma=1.0)
+    body_blur = ndimage.gaussian_filter(body_region, sigma=0.8)
     body_noise = np.std(body_region - body_blur)
 
     noise_diff = abs(header_noise - body_noise)
-    if noise_diff > body_noise * 0.3:  # 30% difference
-        findings.append(f"Header noise differs from body by {noise_diff:.2f}")
-        score += 25
+    noise_ratio = noise_diff / (body_noise + 0.001)
+    if noise_ratio > 0.15:  # 15% difference (was 30%)
+        findings.append(f"Header noise differs by {noise_ratio*100:.1f}% (threshold: 15%)")
+        score += 30
 
     # 2. Analyze text rendering in header specifically
     header_gray = gray[:header_h, :header_w].astype(np.uint8)
@@ -471,29 +475,39 @@ def header_name_analysis(img):
     header_text_features = []
     for cnt in contours:
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw > 10 and ch > 5 and cw * ch > 100:  # Filter small noise
+        if cw > 5 and ch > 3 and cw * ch > 50:  # Lower threshold to catch more text
             roi = header_gray[y:y+ch, x:x+cw]
+            if roi.size == 0:
+                continue
 
             # Features
-            edges = cv2.Canny(roi, 50, 150)
+            edges = cv2.Canny(roi, 30, 100)  # More sensitive edge detection
             edge_density = np.mean(edges > 0)
 
-            # Background around text
-            pad = 2
+            # Background around text - EXPANDED padding
+            pad = 5
             y1, y2 = max(0, y-pad), min(header_h, y+ch+pad)
             x1, x2 = max(0, x-pad), min(header_w, x+cw+pad)
             bg_region = header_gray[y1:y2, x1:x2]
             bg_std = np.std(bg_region)
+            bg_mean = np.mean(bg_region)
+
+            # High-frequency noise in the region
+            roi_float = roi.astype(np.float64)
+            roi_blur = ndimage.gaussian_filter(roi_float, sigma=0.5)
+            roi_noise = np.std(roi_float - roi_blur)
 
             header_text_features.append({
                 'bbox': (x, y, cw, ch),
                 'edge_density': edge_density,
                 'bg_std': bg_std,
+                'bg_mean': bg_mean,
                 'mean_val': np.mean(roi),
+                'noise_level': roi_noise,
             })
 
     # 3. Compare header text to body text
-    body_gray = gray[header_h:, :].astype(np.uint8)
+    body_gray = gray[body_start:body_end, :].astype(np.uint8)
     body_thresh = cv2.adaptiveThreshold(
         body_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV, 11, 2
@@ -501,54 +515,105 @@ def header_name_analysis(img):
     body_contours, _ = cv2.findContours(body_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     body_text_features = []
-    for cnt in body_contours[:50]:  # Sample up to 50
+    for cnt in body_contours[:100]:  # Sample more
         x, y, cw, ch = cv2.boundingRect(cnt)
-        if cw > 10 and ch > 5 and cw * ch > 100:
+        if cw > 5 and ch > 3 and cw * ch > 50:
             roi = body_gray[y:y+ch, x:x+cw]
-            edges = cv2.Canny(roi, 50, 150)
+            if roi.size == 0:
+                continue
+            edges = cv2.Canny(roi, 30, 100)
             edge_density = np.mean(edges > 0)
+
+            roi_float = roi.astype(np.float64)
+            roi_blur = ndimage.gaussian_filter(roi_float, sigma=0.5)
+            roi_noise = np.std(roi_float - roi_blur)
+
             body_text_features.append({
                 'edge_density': edge_density,
                 'mean_val': np.mean(roi),
+                'noise_level': roi_noise,
             })
 
-    # Compare edge densities
+    # Compare features - MORE SENSITIVE thresholds
     if header_text_features and body_text_features:
         header_edge_avg = np.mean([f['edge_density'] for f in header_text_features])
         body_edge_avg = np.mean([f['edge_density'] for f in body_text_features])
 
         edge_diff = abs(header_edge_avg - body_edge_avg)
-        if edge_diff > 0.1:  # Significant difference
-            findings.append(f"Header text sharpness differs: {header_edge_avg:.3f} vs body {body_edge_avg:.3f}")
-            score += 30
+        if edge_diff > 0.05:  # Was 0.1
+            findings.append(f"Header text sharpness: {header_edge_avg:.3f} vs body: {body_edge_avg:.3f}")
+            score += 25
 
         # Compare mean intensities
         header_intensity_avg = np.mean([f['mean_val'] for f in header_text_features])
         body_intensity_avg = np.mean([f['mean_val'] for f in body_text_features])
 
         intensity_diff = abs(header_intensity_avg - body_intensity_avg)
-        if intensity_diff > 20:  # Different text darkness
-            findings.append(f"Header text intensity differs: {header_intensity_avg:.1f} vs body {body_intensity_avg:.1f}")
+        if intensity_diff > 10:  # Was 20
+            findings.append(f"Header text darkness: {header_intensity_avg:.1f} vs body: {body_intensity_avg:.1f}")
             score += 20
 
-    # 4. Check for rectangular "patch" patterns (where text was covered and retyped)
-    # Look for uniform rectangular areas in the header
-    local_var = ndimage.generic_filter(header_gray.astype(np.float64), np.var, size=10)
-    very_uniform = local_var < 5  # Very low variance = potentially pasted/covered area
+        # NEW: Compare noise levels in text regions
+        header_noise_avg = np.mean([f['noise_level'] for f in header_text_features])
+        body_noise_avg = np.mean([f['noise_level'] for f in body_text_features])
+
+        text_noise_diff = abs(header_noise_avg - body_noise_avg)
+        if text_noise_diff > 1.0:
+            findings.append(f"Header text noise: {header_noise_avg:.2f} vs body: {body_noise_avg:.2f}")
+            score += 25
+
+    # 4. Check for rectangular "patch" patterns - MORE SENSITIVE
+    local_var = ndimage.generic_filter(header_gray.astype(np.float64), np.var, size=8)
+    very_uniform = local_var < 10  # Was 5
 
     uniform_ratio = np.mean(very_uniform)
-    if uniform_ratio > 0.1 and uniform_ratio < 0.9:  # Some but not all uniform
-        findings.append(f"Suspicious uniform patches in header: {uniform_ratio*100:.1f}%")
+    if uniform_ratio > 0.05 and uniform_ratio < 0.95:  # Was 0.1 to 0.9
+        findings.append(f"Uniform patches in header: {uniform_ratio*100:.1f}%")
         score += 15
 
-    # 5. Analyze specific "name-like" regions (larger text at top-left)
-    name_candidates = [f for f in header_text_features if f['bbox'][2] > 50 and f['bbox'][3] > 10]
+    # 5. Analyze specific "name-like" regions - MORE AGGRESSIVE
+    name_candidates = [f for f in header_text_features if f['bbox'][2] > 30 and f['bbox'][3] > 8]
     for nc in name_candidates:
         bg_std = nc['bg_std']
-        if bg_std < 3:  # Very uniform background = might be digitally added text
-            findings.append(f"Name region at {nc['bbox'][:2]} has suspiciously uniform background")
+        if bg_std < 8:  # Was 3 - more sensitive
+            findings.append(f"Name at ({nc['bbox'][0]},{nc['bbox'][1]}): suspiciously clean background (std={bg_std:.1f})")
             score += 20
-            break
+
+    # 6. NEW: ELA-like analysis on header specifically
+    header_pil = Image.fromarray(header_gray)
+    buf = io.BytesIO()
+    header_pil.save(buf, "JPEG", quality=85)
+    buf.seek(0)
+    header_resaved = np.array(Image.open(buf).convert("L"), dtype=np.float64)
+
+    ela_diff = np.abs(header_gray.astype(np.float64) - header_resaved)
+    ela_mean = np.mean(ela_diff)
+    ela_std = np.std(ela_diff)
+
+    # Compare ELA to body
+    body_pil = Image.fromarray(body_gray)
+    buf2 = io.BytesIO()
+    body_pil.save(buf2, "JPEG", quality=85)
+    buf2.seek(0)
+    body_resaved = np.array(Image.open(buf2).convert("L"), dtype=np.float64)
+
+    body_ela_diff = np.abs(body_gray.astype(np.float64) - body_resaved)
+    body_ela_mean = np.mean(body_ela_diff)
+
+    ela_ratio = ela_mean / (body_ela_mean + 0.001)
+    if ela_ratio > 1.2 or ela_ratio < 0.8:  # 20% difference
+        findings.append(f"Header ELA differs: {ela_mean:.2f} vs body: {body_ela_mean:.2f} (ratio: {ela_ratio:.2f})")
+        score += 25
+
+    # 7. NEW: Check for anti-aliasing inconsistencies
+    # Edited text often has different anti-aliasing than original
+    header_edges = cv2.Canny(header_gray, 30, 100)
+    edge_pixels = header_gray[header_edges > 0]
+    if len(edge_pixels) > 10:
+        edge_variation = np.std(edge_pixels)
+        if edge_variation < 20:  # Too uniform = digitally rendered text
+            findings.append(f"Header text anti-aliasing too uniform (std={edge_variation:.1f})")
+            score += 15
 
     return findings, min(100, score), header_text_features
 
